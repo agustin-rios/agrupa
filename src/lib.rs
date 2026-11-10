@@ -9,6 +9,7 @@ macro_rules! outln {
     }};
 }
 
+pub mod assignment;
 pub mod config;
 pub mod data;
 pub mod model;

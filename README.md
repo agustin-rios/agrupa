@@ -7,6 +7,8 @@ alumnos.csv + config.toml ──► agrupa armar   ──► grupos.csv (+ repor
 alumnos nuevos            ──► agrupa sugerir ──► grupo recomendado + por qué
 ```
 
+Cómo funciona por dentro (funciones de costo, normalización y algoritmo): [Modelo.md](Modelo.md).
+
 ## 1. Instalación en un PC nuevo (Windows + WSL)
 
 ### 1.1 WSL con Ubuntu (solo la primera vez)

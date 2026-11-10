@@ -238,13 +238,18 @@ cargo fmt             # formato
 
 | Archivo | Responsabilidad |
 | --- | --- |
-| `src/config.rs` | Lectura y validación del TOML |
-| `src/data.rs` | Lectura del CSV |
-| `src/model.rs` | Codificación de alumnos y funciones de costo |
-| `src/state.rs` | Costo incremental |
-| `src/solver.rs` | Recocido simulado |
-| `src/report.rs` | Reportes de texto y JSON |
+| `src/main.rs`, `src/commands.rs` | CLI: argumentos y los comandos `armar`, `sugerir`, `evaluar` |
+| `src/config.rs`, `src/data.rs` | Lectura del TOML y del CSV |
+| `src/roster.rs` | Alumnos: ids, nombres y búsqueda |
+| `src/relations.rs` | Preferencias y restricciones `together`/`apart` |
+| `src/criteria/` | Un archivo por criterio (`balance.rs`, `spread.rs`, `cover.rs`...): costo, referencias y explicaciones |
+| `src/objective.rs` | Qué se minimiza: criterios con su escala |
+| `src/partition.rs` | Quién está en qué grupo |
+| `src/state.rs` | Partición + costo al día tras cada cambio |
+| `src/problem.rs` | Junta alumnos, relaciones y criterios |
+| `src/solver/` | Búsqueda: tamaños, reparto inicial, movimientos, recocido y pulido |
 | `src/suggest.rs` | Sugerencia para alumnos nuevos |
-| `src/assignment.rs` | Lectura y escritura de la asignación (`id,nombre,grupo`) |
-| `src/main.rs` | CLI |
+| `src/report.rs`, `src/assignment.rs` | Reporte de calidad y CSV de asignación |
 | `tests/ejemplos.rs` | Pruebas de punta a punta con `ejemplos/` |
+
+Para agregar un criterio nuevo: un archivo en `src/criteria/` que implemente `GroupwiseCriterion` (o `Criterion`, si no se suma por grupo) y una línea en `from_attribute` de `src/criteria/mod.rs`.

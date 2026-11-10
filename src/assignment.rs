@@ -1,131 +1,157 @@
-//! Lectura y escritura de la asignación (CSV `id,nombre,grupo`).
+//! Lectura y escritura de la asignación: el CSV `id,nombre,grupo`.
 
 use crate::data::Table;
-use crate::model::{Lookup, Model, NONE, preview};
+use crate::partition::Partition;
+use crate::roster::Roster;
+use crate::text::preview;
 use anyhow::{Context, Result, anyhow, bail};
 use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct Assignment {
-    /// Grupo de cada alumno del modelo (`NONE` si no aparece en el archivo).
-    pub group_of: Vec<u32>,
-    /// Nombre de cada grupo tal como viene en el archivo ("1", "A", ...).
+    /// Grupo de cada alumno (`None` si no aparece en el archivo).
+    pub groups: Vec<Option<usize>>,
+    /// Nombre de cada grupo tal como viene en el archivo ("1", "A"...).
     pub labels: Vec<String>,
     pub warnings: Vec<String>,
 }
 
 impl Assignment {
-    pub fn read(path: &Path, m: &Model, id_column: &str) -> Result<Assignment> {
-        let t = Table::read(path, None)?;
-        Self::from_table(&t, m, id_column)
-            .with_context(|| format!("Error en la asignación {}", path.display()))
-    }
-
-    pub fn from_table(t: &Table, m: &Model, id_column: &str) -> Result<Assignment> {
-        let id_col = t
-            .find_column("id")
-            .or_else(|| t.find_column(id_column))
-            .ok_or_else(|| anyhow!("falta la columna 'id'. Columnas: {}", t.headers.join(", ")))?;
-        let g_col = t
-            .find_column("grupo")
-            .or_else(|| t.find_column("group"))
-            .ok_or_else(|| {
-                anyhow!(
-                    "falta la columna 'grupo'. Columnas: {}",
-                    t.headers.join(", ")
-                )
-            })?;
-        let lookup = Lookup::new(&m.ids, &m.names);
-        let mut labels: Vec<String> = Vec::new();
-        let mut group_of = vec![NONE; m.n()];
-        let mut unknown = Vec::new();
-        let mut no_group = 0;
-        for row in &t.rows {
-            let id = row[id_col].trim();
-            let label = row[g_col].trim();
-            if id.is_empty() {
-                continue;
-            }
-            if label.is_empty() {
-                no_group += 1;
-                continue;
-            }
-            let Some(i) = lookup.find_id(id) else {
-                unknown.push(id.to_string());
-                continue;
-            };
-            let g = match labels.iter().position(|l| l == label) {
-                Some(g) => g,
-                None => {
-                    labels.push(label.to_string());
-                    labels.len() - 1
-                }
-            };
-            group_of[i] = g as u32;
-        }
-        if labels.is_empty() {
-            bail!("no hay ningún alumno con grupo");
-        }
-        let mut warnings = Vec::new();
-        if !unknown.is_empty() {
-            warnings.push(format!(
-                "{} ids de la asignación no están en la lista de alumnos y se ignoran: {}",
-                unknown.len(),
-                preview(&unknown)
-            ));
-        }
-        if no_group > 0 {
-            warnings.push(format!("{no_group} filas de la asignación no tienen grupo"));
-        }
-
-        // Ordena los grupos: numéricamente si todos son números; si no, por aparición.
-        let numeric: Option<Vec<i64>> = labels.iter().map(|l| l.parse().ok()).collect();
-        if let Some(nums) = numeric {
-            let mut order: Vec<usize> = (0..labels.len()).collect();
-            order.sort_by_key(|&g| nums[g]);
-            let mut rank = vec![0u32; labels.len()];
-            for (r, &g) in order.iter().enumerate() {
-                rank[g] = r as u32;
-            }
-            for g in group_of.iter_mut().filter(|g| **g != NONE) {
-                *g = rank[*g as usize];
-            }
-            labels = order.iter().map(|&g| labels[g].clone()).collect();
-        }
-        Ok(Assignment {
-            group_of,
-            labels,
-            warnings,
-        })
-    }
-
-    pub fn numbered(group_of: Vec<u32>, k: usize) -> Assignment {
+    /// Grupos numerados 1..K.
+    pub fn numbered(groups: &[usize], group_count: usize) -> Assignment {
         Assignment {
-            group_of,
-            labels: (1..=k).map(|g| g.to_string()).collect(),
+            groups: groups.iter().map(|&g| Some(g)).collect(),
+            labels: (1..=group_count).map(|g| g.to_string()).collect(),
             warnings: Vec::new(),
         }
     }
 
-    pub fn k(&self) -> usize {
+    pub fn read(path: &Path, roster: &Roster, id_column: &str) -> Result<Assignment> {
+        let table = Table::read(path, None)?;
+        Self::from_table(&table, roster, id_column)
+            .with_context(|| format!("Error en la asignación {}", path.display()))
+    }
+
+    /// Lee las columnas `id` (o la de la configuración) y `grupo`; el resto se ignora.
+    pub fn from_table(table: &Table, roster: &Roster, id_column: &str) -> Result<Assignment> {
+        let id_index = find_column(table, &["id", id_column])?;
+        let group_index = find_column(table, &["grupo", "group"])?;
+        let mut labels: Vec<String> = Vec::new();
+        let mut groups = vec![None; roster.len()];
+        let mut unknown_ids = Vec::new();
+        let mut without_group = 0;
+        for row in &table.rows {
+            let (id, label) = (row[id_index].trim(), row[group_index].trim());
+            if id.is_empty() {
+                continue;
+            }
+            if label.is_empty() {
+                without_group += 1;
+                continue;
+            }
+            let Some(student) = roster.find_by_id(id) else {
+                unknown_ids.push(id.to_string());
+                continue;
+            };
+            groups[student] = Some(label_index(&mut labels, label));
+        }
+        if labels.is_empty() {
+            bail!("no hay ningún alumno con grupo");
+        }
+
+        let mut warnings = Vec::new();
+        if !unknown_ids.is_empty() {
+            warnings.push(format!(
+                "{} ids de la asignación no están en la lista de alumnos y se ignoran: {}",
+                unknown_ids.len(),
+                preview(&unknown_ids)
+            ));
+        }
+        if without_group > 0 {
+            warnings.push(format!(
+                "{without_group} filas de la asignación no tienen grupo"
+            ));
+        }
+        let mut assignment = Assignment {
+            groups,
+            labels,
+            warnings,
+        };
+        assignment.sort_numeric_labels();
+        Ok(assignment)
+    }
+
+    pub fn group_count(&self) -> usize {
         self.labels.len()
     }
 
+    pub fn partition(&self) -> Partition {
+        Partition::new(self.group_count(), self.groups.clone())
+    }
+
     /// Escribe `id,nombre,grupo`, ordenado por grupo y luego según la lista de alumnos.
-    pub fn write(&self, path: &Path, m: &Model) -> Result<()> {
-        let mut w = csv::Writer::from_path(path)
+    pub fn write(&self, path: &Path, roster: &Roster) -> Result<()> {
+        let mut writer = csv::Writer::from_path(path)
             .with_context(|| format!("No pude escribir {}", path.display()))?;
-        w.write_record(["id", "nombre", "grupo"])?;
-        let mut order: Vec<usize> = (0..m.n()).filter(|&i| self.group_of[i] != NONE).collect();
-        order.sort_by_key(|&i| self.group_of[i]);
-        for i in order {
-            w.write_record([
-                &m.ids[i],
-                &m.names[i],
-                &self.labels[self.group_of[i] as usize],
+        writer.write_record(["id", "nombre", "grupo"])?;
+        let mut assigned: Vec<(usize, usize)> = self
+            .groups
+            .iter()
+            .enumerate()
+            .filter_map(|(student, group)| Some((student, (*group)?)))
+            .collect();
+        assigned.sort_by_key(|&(_, group)| group);
+        for (student, group) in assigned {
+            writer.write_record([
+                roster.id(student),
+                roster.name(student),
+                &self.labels[group],
             ])?;
         }
-        w.flush()?;
+        writer.flush()?;
         Ok(())
     }
+
+    /// Si todos los grupos son números, los ordena numéricamente ("2" antes que "10").
+    fn sort_numeric_labels(&mut self) {
+        let Some(numbers) = self
+            .labels
+            .iter()
+            .map(|l| l.parse::<i64>().ok())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return;
+        };
+        let mut order: Vec<usize> = (0..self.labels.len()).collect();
+        order.sort_by_key(|&g| numbers[g]);
+        let mut new_index = vec![0; order.len()];
+        for (index, &group) in order.iter().enumerate() {
+            new_index[group] = index;
+        }
+        for group in self.groups.iter_mut().flatten() {
+            *group = new_index[*group];
+        }
+        self.labels = order.iter().map(|&g| self.labels[g].clone()).collect();
+    }
+}
+
+fn find_column(table: &Table, names: &[&str]) -> Result<usize> {
+    names
+        .iter()
+        .find_map(|name| table.find_column(name))
+        .ok_or_else(|| {
+            anyhow!(
+                "falta la columna '{}'. Columnas: {}",
+                names[0],
+                table.headers.join(", ")
+            )
+        })
+}
+
+/// Índice del grupo con esa etiqueta, agregándolo si es nuevo.
+fn label_index(labels: &mut Vec<String>, label: &str) -> usize {
+    labels.iter().position(|l| l == label).unwrap_or_else(|| {
+        labels.push(label.to_string());
+        labels.len() - 1
+    })
 }

@@ -3,141 +3,160 @@
 use agrupa::assignment::Assignment;
 use agrupa::config::Config;
 use agrupa::data::Table;
-use agrupa::model::{EdgeKind, Model, NONE};
-use agrupa::solver::{self, Layout, Params};
-use agrupa::state::State;
+use agrupa::partition::Partition;
+use agrupa::problem::Problem;
+use agrupa::solver::{self, Layout, SearchParams, even_sizes};
 use agrupa::suggest;
 use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
 use std::path::Path;
 
-fn load(extra: bool) -> (Config, Table) {
+fn load(with_newcomers: bool) -> (Config, Table) {
     let cfg = Config::load(Path::new("ejemplos/config.toml")).unwrap();
-    let mut t = Table::read(Path::new("ejemplos/alumnos.csv"), None).unwrap();
-    if extra {
-        t.append(&Table::read(Path::new("ejemplos/nuevos.csv"), None).unwrap());
+    let mut table = Table::read(Path::new("ejemplos/alumnos.csv"), None).unwrap();
+    if with_newcomers {
+        table.append(&Table::read(Path::new("ejemplos/nuevos.csv"), None).unwrap());
     }
-    (cfg, t)
+    (cfg, table)
 }
 
-fn random_assignment(sizes: &[usize], rng: &mut StdRng) -> Vec<u32> {
-    let mut v: Vec<u32> = sizes
+/// El problema de ejemplo, calibrado para su distribución de grupos.
+fn example() -> (Problem, Layout) {
+    let (cfg, table) = load(false);
+    let mut problem = Problem::from_table(&table, &cfg).unwrap();
+    let layout = Layout::new(problem.student_count(), &cfg.groups).unwrap();
+    problem.calibrate(&layout.target_sizes);
+    (problem, layout)
+}
+
+fn random_groups(sizes: &[usize], rng: &mut StdRng) -> Vec<usize> {
+    let mut groups: Vec<usize> = sizes
         .iter()
         .enumerate()
-        .flat_map(|(g, &s)| std::iter::repeat_n(g as u32, s))
+        .flat_map(|(g, &s)| std::iter::repeat_n(g, s))
         .collect();
-    v.shuffle(rng);
-    v
+    groups.shuffle(rng);
+    groups
 }
 
 /// El valor "al azar" de cada criterio debe coincidir con el promedio de repartos al azar.
 #[test]
-fn calibration_matches_random_average() {
-    let (cfg, t) = load(false);
-    let mut m = Model::build(&t, &cfg).unwrap();
-    let layout = Layout::new(m.n(), &cfg.groups).unwrap();
-    m.calibrate(&layout.sizes);
+fn reference_matches_random_average() {
+    let (problem, layout) = example();
     let mut rng = StdRng::seed_from_u64(1);
     let trials = 20_000;
-    let mut sum = vec![0.0; m.n_crit()];
+    let terms = problem.objective.terms();
+    let mut sums = vec![0.0; terms.len()];
     for _ in 0..trials {
-        let st = State::new(&m, layout.k, random_assignment(&layout.sizes, &mut rng));
-        for (s, r) in sum.iter_mut().zip(&st.raw) {
-            *s += r;
+        let groups = random_groups(&layout.target_sizes, &mut rng);
+        let state = problem.state(Partition::complete(layout.group_count, &groups));
+        for (term, sum) in sums.iter_mut().enumerate() {
+            *sum += state.tracker(term).cost();
         }
     }
-    for (c, s) in m.calib.crit.iter().zip(&sum) {
-        let avg = s / trials as f64;
+    for (term, sum) in terms.iter().zip(&sums).filter(|(t, _)| !t.is_hard()) {
+        let average = sum / trials as f64;
+        let reference = term.reference;
         assert!(
-            (avg - c.random).abs() <= 0.02 * c.random.max(0.1),
-            "promedio {avg} vs. al azar {}",
-            c.random
+            (average - reference.random).abs() <= 0.02 * reference.random.max(0.1),
+            "{}: promedio {average} vs. al azar {}",
+            term.criterion.meta().label,
+            reference.random
         );
-        assert!(c.ideal <= c.random);
+        assert!(reference.ideal <= reference.random);
     }
 }
 
 #[test]
 fn armar_respects_constraints_and_sizes() {
-    let (cfg, t) = load(false);
-    let mut m = Model::build(&t, &cfg).unwrap();
-    let layout = Layout::new(m.n(), &cfg.groups).unwrap();
-    m.calibrate(&layout.sizes);
-    let params = Params {
+    let (problem, layout) = example();
+    let params = SearchParams {
         iterations: 50_000,
         restarts: 2,
         seed: 3,
     };
-    let g = solver::solve(&m, &layout, &params).unwrap();
-    let st = State::new(&m, layout.k, g.clone());
-    assert_eq!(st.hard, 0.0);
-    let mut sizes = st.sizes.clone();
+    let groups = solver::solve(&problem, &layout, &params).unwrap();
+    let state = problem.state(Partition::complete(layout.group_count, &groups));
+
+    let mut sizes = state.partition().sizes();
     sizes.sort_unstable();
     assert_eq!(sizes, vec![3, 3, 4, 4, 4, 4, 4, 4]);
-    for b in &m.blocks {
-        assert!(b.iter().all(|&i| g[i] == g[b[0]]));
+    for block in problem.relations.blocks.all() {
+        assert!(block.iter().all(|&s| groups[s] == groups[block[0]]));
     }
-    for e in m.edges.iter().filter(|e| e.kind == EdgeKind::Apart) {
-        assert_ne!(g[e.a], g[e.b]);
+    for &(a, b) in &problem.relations.apart {
+        assert_ne!(groups[a], groups[b]);
     }
-    // Mucho mejor que al azar en el total.
-    let total_weight: f64 = cfg.attributes.iter().map(|a| a.weight).sum::<f64>() + 1.0;
-    let scaled: f64 = (0..m.n_crit()).map(|c| st.weighted(c)).sum();
+    // Mucho mejor que al azar, que en promedio cuesta la suma de los pesos.
+    let soft_weight: f64 = problem
+        .objective
+        .terms()
+        .iter()
+        .filter(|t| !t.is_hard())
+        .map(|t| t.criterion.meta().weight)
+        .sum();
     assert!(
-        scaled < 0.5 * total_weight,
-        "costo {scaled} de {total_weight}"
+        state.total() < 0.5 * soft_weight,
+        "costo {} de {soft_weight}",
+        state.total()
     );
 }
 
 #[test]
 fn same_seed_same_result() {
-    let (cfg, t) = load(false);
-    let mut m = Model::build(&t, &cfg).unwrap();
-    let layout = Layout::new(m.n(), &cfg.groups).unwrap();
-    m.calibrate(&layout.sizes);
-    let params = Params {
+    let (problem, layout) = example();
+    let params = SearchParams {
         iterations: 20_000,
         restarts: 4,
         seed: 9,
     };
     assert_eq!(
-        solver::solve(&m, &layout, &params).unwrap(),
-        solver::solve(&m, &layout, &params).unwrap()
+        solver::solve(&problem, &layout, &params).unwrap(),
+        solver::solve(&problem, &layout, &params).unwrap()
     );
 }
 
 #[test]
-fn suggests_group_missing_the_tag() {
-    let (cfg, t) = load(true);
-    let mut m = Model::build(&t, &cfg).unwrap();
-    // Asignación previa: los 30 originales en 8 grupos; los nuevos sin grupo.
-    let (cfg0, t0) = load(false);
-    let mut m0 = Model::build(&t0, &cfg0).unwrap();
-    let layout = Layout::new(m0.n(), &cfg0.groups).unwrap();
-    m0.calibrate(&layout.sizes);
-    let g0 = solver::solve(
-        &m0,
+fn newcomers_fill_the_small_groups_without_moving_anyone() {
+    let (original, layout) = example();
+    let before = solver::solve(
+        &original,
         &layout,
-        &Params {
+        &SearchParams {
             iterations: 50_000,
             restarts: 2,
             seed: 1,
         },
     )
     .unwrap();
-    let mut group_of = vec![NONE; m.n()];
-    group_of[..g0.len()].copy_from_slice(&g0);
-    let asg = Assignment::numbered(group_of, layout.k);
 
-    m.calibrate(&Layout::even_sizes(m.n(), asg.k()));
-    let mut st = State::new(&m, asg.k(), asg.group_of.clone());
-    let sizes_before = st.sizes.clone();
-    let sugs = suggest::suggest_all(&mut st, &asg.labels, None);
-    assert_eq!(sugs.len(), 2);
-    assert!(st.group_of.iter().all(|&g| g != NONE));
-    // Nadie se movió.
-    assert_eq!(&st.group_of[..g0.len()], &g0[..]);
-    // Se llenan primero los grupos de 3.
-    for s in &sugs {
-        assert_eq!(sizes_before[s.chosen().group], 3);
+    let (cfg, table) = load(true);
+    let mut problem = Problem::from_table(&table, &cfg).unwrap();
+    let mut groups: Vec<usize> = before.clone();
+    groups.resize(problem.student_count(), usize::MAX);
+    let assignment = Assignment {
+        groups: groups
+            .iter()
+            .map(|&g| (g != usize::MAX).then_some(g))
+            .collect(),
+        labels: (1..=layout.group_count).map(|g| g.to_string()).collect(),
+        warnings: Vec::new(),
+    };
+    problem.calibrate(&even_sizes(
+        problem.student_count(),
+        assignment.group_count(),
+    ));
+    let mut state = problem.state(assignment.partition());
+    let sizes_before = state.partition().sizes();
+
+    let suggestions = suggest::suggest_all(&problem, &mut state, &assignment.labels, None);
+    assert_eq!(suggestions.len(), 2);
+    let after = state.partition().assignment();
+    assert!(after.iter().all(Option::is_some));
+    assert!(
+        before.iter().enumerate().all(|(s, &g)| after[s] == Some(g)),
+        "nadie se movió"
+    );
+    for suggestion in &suggestions {
+        assert_eq!(sizes_before[suggestion.chosen().group], 3);
     }
 }

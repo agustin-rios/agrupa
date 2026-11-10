@@ -315,4 +315,4 @@ Los enlaces vienen de [Discovery.md](Discovery.md), el documento de exploración
 - [Gallego et al., tabu search para el MDGP](https://fitforthem.unipa.it/rep:6533b836fe1ef96bd12a0ba2) y [recocido simulado adaptativo (AAAI)](https://ojs.aaai.org/index.php/AAAI/article/view/41006/44967): metaheurísticas comparables al recocido de agrupa.
 - Kirkpatrick, Gelatt y Vecchi (1983), "Optimization by Simulated Annealing", Science 220: el método de búsqueda.
 
-En el código, cada sección tiene su módulo: [src/model.rs](src/model.rs) (secciones 2 a 4), [src/solver.rs](src/solver.rs) (5 y 6), [src/state.rs](src/state.rs) (costo incremental), [src/suggest.rs](src/suggest.rs) (7) y [tests/ejemplos.rs](tests/ejemplos.rs) (8).
+En el código: cada criterio de la sección 3 tiene su archivo en [src/criteria/](src/criteria/) con su costo y sus referencias (sección 4); los tamaños y la búsqueda (secciones 5 y 6) están en [src/solver/](src/solver/), el costo incremental en [src/state.rs](src/state.rs), la sugerencia (sección 7) en [src/suggest.rs](src/suggest.rs) y las pruebas (sección 8) en [tests/ejemplos.rs](tests/ejemplos.rs).

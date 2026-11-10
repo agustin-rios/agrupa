@@ -1,289 +1,179 @@
-//! Costo incremental: mantiene agregados por grupo para evaluar un cambio
-//! (mover o intercambiar alumnos) sin recalcular todo.
+//! Una partición junto con el costo de cada criterio, al día tras cada cambio.
+//!
+//! `State` no sabe calcular costos: le avisa a cada criterio qué cambió y suma lo que
+//! cada uno responde, multiplicado por su escala.
 
-use crate::model::{AttrData, Edge, EdgeKind, Model, NONE, lab_term, num_term};
+use crate::criteria::{Change, Step, Tracker};
+use crate::objective::Objective;
+use crate::partition::Partition;
 
-#[derive(Debug, Clone)]
-enum Agg {
-    Num {
-        sum: Vec<f64>,
-        sumsq: Vec<f64>,
-    },
-    /// Conteos por grupo y valor, en una matriz plana `k × c`.
-    Lab {
-        counts: Vec<u32>,
-        c: usize,
-    },
+/// Un alumno que pasa a otro grupo (o queda sin grupo).
+#[derive(Debug, Clone, Copy)]
+pub struct Move {
+    pub student: usize,
+    pub to: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
-pub struct State<'m> {
-    pub m: &'m Model,
-    pub k: usize,
-    pub group_of: Vec<u32>,
-    pub sizes: Vec<usize>,
-    pub members: Vec<Vec<u32>>,
-    pos: Vec<usize>,
-    aggs: Vec<Agg>,
-    /// Costo de cada atributo en cada grupo: `terms[atributo][grupo]`.
-    terms: Vec<Vec<f64>>,
-    /// Costo crudo por criterio (atributos y preferencias).
-    pub raw: Vec<f64>,
-    /// Restricciones `apart` incumplidas.
-    pub hard: f64,
-    stamp: Vec<u32>,
-    epoch: u32,
-    scratch_edges: Vec<(u32, f64)>,
-    scratch_groups: Vec<usize>,
-}
-
-impl<'m> State<'m> {
-    pub fn new(m: &'m Model, k: usize, group_of: Vec<u32>) -> Self {
-        let n = m.n();
-        assert_eq!(group_of.len(), n);
-        let mut sizes = vec![0; k];
-        let mut members = vec![Vec::new(); k];
-        let mut pos = vec![usize::MAX; n];
-        for (i, &g) in group_of.iter().enumerate() {
-            if g != NONE {
-                let g = g as usize;
-                sizes[g] += 1;
-                pos[i] = members[g].len();
-                members[g].push(i as u32);
-            }
+impl Move {
+    pub fn to_group(student: usize, group: usize) -> Move {
+        Move {
+            student,
+            to: Some(group),
         }
-        let aggs = m
-            .attrs
+    }
+
+    pub fn unassign(student: usize) -> Move {
+        Move { student, to: None }
+    }
+}
+
+pub struct State<'a> {
+    objective: &'a Objective,
+    partition: Partition,
+    trackers: Vec<Box<dyn Tracker + 'a>>,
+    /// Pasos del último cambio aplicado, para poder deshacerlo.
+    last_steps: Vec<Step>,
+    /// Grupos que tocó el último cambio.
+    touched_groups: Vec<usize>,
+    /// Búfer reutilizado al deshacer, para no reservar memoria en cada intento.
+    undo_moves: Vec<Move>,
+}
+
+impl<'a> State<'a> {
+    pub fn new(objective: &'a Objective, partition: Partition) -> Self {
+        let trackers = objective
+            .terms()
             .iter()
-            .map(|a| match &a.data {
-                AttrData::Num { centered, .. } => {
-                    let mut sum = vec![0.0; k];
-                    let mut sumsq = vec![0.0; k];
-                    for (i, &g) in group_of.iter().enumerate() {
-                        if g != NONE {
-                            sum[g as usize] += centered[i];
-                            sumsq[g as usize] += centered[i] * centered[i];
-                        }
-                    }
-                    Agg::Num { sum, sumsq }
-                }
-                AttrData::Lab { values, labels, .. } => {
-                    let c = labels.len();
-                    let mut counts = vec![0; k * c];
-                    for (i, &g) in group_of.iter().enumerate() {
-                        if g != NONE {
-                            for &v in &values[i] {
-                                counts[g as usize * c + v as usize] += 1;
-                            }
-                        }
-                    }
-                    Agg::Lab { counts, c }
-                }
-            })
+            .map(|term| term.criterion.tracker(&partition))
             .collect();
-        let mut st = State {
-            m,
-            k,
-            group_of,
-            sizes,
-            members,
-            pos,
-            aggs,
-            terms: vec![vec![0.0; k]; m.attrs.len()],
-            raw: vec![0.0; m.n_crit()],
-            hard: 0.0,
-            stamp: vec![0; m.edges.len()],
-            epoch: 0,
-            scratch_edges: Vec::new(),
-            scratch_groups: Vec::new(),
-        };
-        for a in 0..m.attrs.len() {
-            for g in 0..k {
-                st.terms[a][g] = st.term(a, g);
-            }
-            st.raw[a] = st.terms[a].iter().sum();
+        State {
+            objective,
+            partition,
+            trackers,
+            last_steps: Vec::new(),
+            touched_groups: Vec::new(),
+            undo_moves: Vec::new(),
         }
-        for e in &m.edges {
-            let c = st.edge_cost(e);
-            match e.kind {
-                EdgeKind::Apart => st.hard += c,
-                _ => st.raw[m.attrs.len()] += c,
-            }
-        }
-        st
     }
 
-    /// Costo total ponderado (lo que minimiza el solver).
+    pub fn partition(&self) -> &Partition {
+        &self.partition
+    }
+
+    pub fn into_partition(self) -> Partition {
+        self.partition
+    }
+
+    pub fn objective(&self) -> &Objective {
+        self.objective
+    }
+
+    /// Costo total: Σ escala × costo de cada criterio.
     pub fn total(&self) -> f64 {
-        let soft: f64 = self
-            .raw
+        self.objective
+            .terms()
             .iter()
-            .zip(&self.m.calib.crit)
-            .map(|(r, c)| r * c.scale)
-            .sum();
-        soft + self.hard * self.m.hard_penalty
+            .zip(&self.trackers)
+            .map(|(term, tracker)| term.scale * tracker.cost())
+            .sum()
     }
 
-    /// Costo ponderado de un criterio, medido desde su ideal.
-    pub fn weighted(&self, crit: usize) -> f64 {
-        let c = &self.m.calib.crit[crit];
-        (self.raw[crit] - c.ideal) * c.scale
+    /// El seguimiento del criterio `term` (mismo orden que en el objetivo).
+    pub fn tracker(&self, term: usize) -> &dyn Tracker {
+        self.trackers[term].as_ref()
     }
 
-    fn term(&self, a: usize, g: usize) -> f64 {
-        let attr = &self.m.attrs[a];
-        match (&self.aggs[a], &attr.data) {
-            (Agg::Num { sum, sumsq }, _) => num_term(attr.goal, self.sizes[g], sum[g], sumsq[g]),
-            (Agg::Lab { counts, c }, AttrData::Lab { totals, .. }) => lab_term(
-                attr.goal,
-                self.sizes[g],
-                &counts[g * c..(g + 1) * c],
-                totals,
-                self.m.n(),
-            ),
-            _ => unreachable!("agregado y datos del atributo no coinciden"),
+    /// Aplica los cambios y devuelve cuánto cambió el costo total.
+    pub fn apply(&mut self, moves: &[Move]) -> f64 {
+        self.record(moves);
+        for step in &self.last_steps {
+            self.partition.move_student(step.student, step.to);
         }
-    }
-
-    /// Costo de una arista; no cuenta si alguno de los dos no tiene grupo.
-    fn edge_cost(&self, e: &Edge) -> f64 {
-        let (ga, gb) = (self.group_of[e.a], self.group_of[e.b]);
-        if ga == NONE || gb == NONE {
-            0.0
-        } else {
-            e.cost(ga == gb)
+        let change = Change {
+            steps: &self.last_steps,
+            groups: &self.touched_groups,
+        };
+        let mut delta = 0.0;
+        for (term, tracker) in self.objective.terms().iter().zip(&mut self.trackers) {
+            delta += term.scale * tracker.update(&change, &self.partition);
         }
-    }
-
-    /// Aplica los cambios `(alumno, grupo nuevo)` (o `NONE` para sacarlo) y devuelve
-    /// cuánto cambió el costo total. Para deshacer, aplica los grupos anteriores.
-    pub fn apply(&mut self, moves: &[(usize, u32)]) -> f64 {
-        let m = self.m;
-        let mut delta = -self.hard * m.hard_penalty;
-
-        // Aristas afectadas, contadas una sola vez.
-        self.epoch = self.epoch.wrapping_add(1);
-        if self.epoch == 0 {
-            self.stamp.fill(0);
-            self.epoch = 1;
-        }
-        let mut edges = std::mem::take(&mut self.scratch_edges);
-        edges.clear();
-        for &(s, _) in moves {
-            for &e in &m.adj[s] {
-                if self.stamp[e as usize] != self.epoch {
-                    self.stamp[e as usize] = self.epoch;
-                    edges.push((e, self.edge_cost(&m.edges[e as usize])));
-                }
-            }
-        }
-
-        // Grupos afectados.
-        let mut groups = std::mem::take(&mut self.scratch_groups);
-        groups.clear();
-        for &(s, to) in moves {
-            for g in [self.group_of[s], to] {
-                if g != NONE && !groups.contains(&(g as usize)) {
-                    groups.push(g as usize);
-                }
-            }
-        }
-
-        // Mover y actualizar agregados.
-        for &(s, to) in moves {
-            let from = self.group_of[s];
-            if from == to {
-                continue;
-            }
-            if from != NONE {
-                self.detach(s, from as usize);
-            }
-            if to != NONE {
-                self.attach(s, to as usize);
-            }
-            self.group_of[s] = to;
-        }
-
-        for a in 0..m.attrs.len() {
-            let scale = m.calib.crit[a].scale;
-            for &g in &groups {
-                let new = self.term(a, g);
-                let diff = new - self.terms[a][g];
-                self.terms[a][g] = new;
-                self.raw[a] += diff;
-                delta += diff * scale;
-            }
-        }
-
-        let pref = m.attrs.len();
-        for &(e, old) in &edges {
-            let edge = &m.edges[e as usize];
-            let diff = self.edge_cost(edge) - old;
-            match edge.kind {
-                EdgeKind::Apart => self.hard += diff,
-                _ => {
-                    self.raw[pref] += diff;
-                    delta += diff * m.calib.crit[pref].scale;
-                }
-            }
-        }
-        delta += self.hard * m.hard_penalty;
-
-        self.scratch_edges = edges;
-        self.scratch_groups = groups;
         delta
     }
 
-    fn detach(&mut self, s: usize, g: usize) {
-        let p = self.pos[s];
-        self.members[g].swap_remove(p);
-        if let Some(&moved) = self.members[g].get(p) {
-            self.pos[moved as usize] = p;
+    /// Aplica los cambios y los deja solo si `accept` aprueba el cambio de costo.
+    pub fn try_apply(&mut self, moves: &[Move], accept: impl FnOnce(f64) -> bool) -> bool {
+        let delta = self.apply(moves);
+        let accepted = accept(delta);
+        if !accepted {
+            self.undo_last();
         }
-        self.pos[s] = usize::MAX;
-        self.sizes[g] -= 1;
-        self.update_aggs(s, g, -1);
+        accepted
     }
 
-    fn attach(&mut self, s: usize, g: usize) {
-        self.pos[s] = self.members[g].len();
-        self.members[g].push(s as u32);
-        self.sizes[g] += 1;
-        self.update_aggs(s, g, 1);
+    /// Cuánto cambiaría el costo total con estos cambios, sin dejarlos hechos.
+    pub fn cost_change(&mut self, moves: &[Move]) -> f64 {
+        let delta = self.apply(moves);
+        self.undo_last();
+        delta
     }
 
-    fn update_aggs(&mut self, s: usize, g: usize, sign: i32) {
-        for (agg, attr) in self.aggs.iter_mut().zip(&self.m.attrs) {
-            match (agg, &attr.data) {
-                (Agg::Num { sum, sumsq }, AttrData::Num { centered, .. }) => {
-                    let x = centered[s];
-                    sum[g] += sign as f64 * x;
-                    sumsq[g] += sign as f64 * x * x;
-                }
-                (Agg::Lab { counts, c }, AttrData::Lab { values, .. }) => {
-                    for &v in &values[s] {
-                        let cell = &mut counts[g * *c + v as usize];
-                        *cell = cell.wrapping_add_signed(sign);
-                    }
-                }
-                _ => unreachable!("agregado y datos del atributo no coinciden"),
+    /// Como `cost_change`, pero criterio por criterio (ya escalado).
+    pub fn cost_change_by_term(&mut self, moves: &[Move]) -> Vec<f64> {
+        let before: Vec<f64> = self.trackers.iter().map(|t| t.cost()).collect();
+        self.apply(moves);
+        let deltas = self
+            .objective
+            .terms()
+            .iter()
+            .zip(&self.trackers)
+            .zip(before)
+            .map(|((term, tracker), before)| term.scale * (tracker.cost() - before))
+            .collect();
+        self.undo_last();
+        deltas
+    }
+
+    /// Lleva la partición a la asignación dada (por ejemplo, la mejor encontrada).
+    pub fn reset_to(&mut self, assignment: &[Option<usize>]) {
+        let moves: Vec<Move> = assignment
+            .iter()
+            .enumerate()
+            .filter(|&(student, &group)| self.partition.group_of(student) != group)
+            .map(|(student, &to)| Move { student, to })
+            .collect();
+        self.apply(&moves);
+    }
+
+    fn undo_last(&mut self) {
+        let mut undo = std::mem::take(&mut self.undo_moves);
+        undo.clear();
+        undo.extend(self.last_steps.iter().map(|step| Move {
+            student: step.student,
+            to: step.from,
+        }));
+        self.apply(&undo);
+        self.undo_moves = undo;
+    }
+
+    /// Anota los pasos reales (ignora los que no cambian de grupo) y los grupos que tocan.
+    fn record(&mut self, moves: &[Move]) {
+        self.last_steps.clear();
+        self.touched_groups.clear();
+        for mv in moves {
+            let from = self.partition.group_of(mv.student);
+            if from == mv.to {
+                continue;
             }
-        }
-    }
-
-    /// Suma de valores centrados del atributo numérico `a` en el grupo `g`.
-    pub fn num_sum(&self, a: usize, g: usize) -> f64 {
-        match &self.aggs[a] {
-            Agg::Num { sum, .. } => sum[g],
-            Agg::Lab { .. } => 0.0,
-        }
-    }
-
-    /// Conteos por valor del atributo categórico/etiquetas `a` en el grupo `g`.
-    pub fn counts(&self, a: usize, g: usize) -> &[u32] {
-        match &self.aggs[a] {
-            Agg::Lab { counts, c } => &counts[g * c..(g + 1) * c],
-            Agg::Num { .. } => &[],
+            self.last_steps.push(Step {
+                student: mv.student,
+                from,
+                to: mv.to,
+            });
+            for group in [from, mv.to].into_iter().flatten() {
+                if !self.touched_groups.contains(&group) {
+                    self.touched_groups.push(group);
+                }
+            }
         }
     }
 }
@@ -293,9 +183,10 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::data::Table;
+    use crate::problem::Problem;
     use rand::{Rng, SeedableRng, rngs::StdRng};
 
-    const CSV: &str = "id,nombre,g,nota,hab,horario,quiere,evita
+    const STUDENTS: &str = "id,nombre,g,nota,hab,horario,quiere,evita
 a1,Ana,F,5.0,\"Front, Back\",M,a2,
 a2,Beto,M,6.1,Back,T,,a3
 a3,Caro,F,4.2,Datos,M,a1,
@@ -306,7 +197,7 @@ a7,Gabi,F,3.9,UX,T,,
 a8,Hugo,M,5.1,Front,M,a7,
 ";
 
-    const CFG: &str = r#"
+    const CONFIG: &str = r#"
 id_column = "id"
 name_column = "nombre"
 [groups]
@@ -338,59 +229,59 @@ avoid_column = "evita"
 apart = [["a1", "a6"]]
 "#;
 
-    fn model() -> Model {
-        let t = Table::parse(CSV, None).unwrap();
-        let cfg = Config::parse(CFG).unwrap();
-        let mut m = Model::build(&t, &cfg).unwrap();
-        m.calibrate(&[3, 3, 2]);
-        m
+    fn problem() -> Problem {
+        let table = Table::parse(STUDENTS, None).unwrap();
+        let mut problem = Problem::from_table(&table, &Config::parse(CONFIG).unwrap()).unwrap();
+        problem.calibrate(&[3, 3, 2]);
+        problem
+    }
+
+    fn groups(assignment: &[usize]) -> Partition {
+        Partition::complete(3, assignment)
     }
 
     #[test]
-    fn incremental_matches_full_recompute() {
-        let m = model();
+    fn incremental_cost_matches_full_recompute() {
+        let problem = problem();
         let mut rng = StdRng::seed_from_u64(7);
-        let start: Vec<u32> = vec![0, 0, 0, 1, 1, 1, 2, 2];
-        let mut st = State::new(&m, 3, start);
-        let mut total = st.total();
+        let mut state = problem.state(groups(&[0, 0, 0, 1, 1, 1, 2, 2]));
+        let mut total = state.total();
         for _ in 0..500 {
-            let i = rng.gen_range(0..8);
+            let student = rng.gen_range(0..8);
             let to = if rng.gen_bool(0.1) {
-                NONE
+                None
             } else {
-                rng.gen_range(0..3)
+                Some(rng.gen_range(0..3))
             };
-            total += st.apply(&[(i, to)]);
-            let fresh = State::new(&m, 3, st.group_of.clone());
+            total += state.apply(&[Move { student, to }]);
+            let fresh = problem.state(state.partition().clone());
             assert!(
                 (fresh.total() - total).abs() < 1e-9,
                 "{} vs {}",
                 fresh.total(),
                 total
             );
-            for (a, b) in fresh.raw.iter().zip(&st.raw) {
-                assert!((a - b).abs() < 1e-9);
+            for term in 0..problem.objective.terms().len() {
+                assert!((fresh.tracker(term).cost() - state.tracker(term).cost()).abs() < 1e-9);
             }
-            assert_eq!(fresh.sizes, st.sizes);
         }
     }
 
     #[test]
-    fn swap_then_revert_restores_cost() {
-        let m = model();
-        let mut st = State::new(&m, 3, vec![0, 0, 0, 1, 1, 1, 2, 2]);
-        let before = st.total();
-        let d = st.apply(&[(0, 1), (3, 0)]);
-        let back = st.apply(&[(0, 0), (3, 1)]);
-        assert!((d + back).abs() < 1e-12);
-        assert!((st.total() - before).abs() < 1e-12);
+    fn rejected_change_leaves_cost_untouched() {
+        let problem = problem();
+        let mut state = problem.state(groups(&[0, 0, 0, 1, 1, 1, 2, 2]));
+        let before = state.total();
+        let accepted = state.try_apply(&[Move::to_group(0, 1), Move::to_group(3, 0)], |_| false);
+        assert!(!accepted);
+        assert!((state.total() - before).abs() < 1e-12);
+        assert_eq!(state.partition().group_of(0), Some(0));
     }
 
     #[test]
-    fn apart_violation_is_hard() {
-        let m = model();
-        let st = State::new(&m, 3, vec![0, 1, 1, 1, 2, 0, 2, 2]);
-        assert_eq!(st.hard, 1.0);
-        assert!(st.total() >= m.hard_penalty);
+    fn apart_violation_costs_the_hard_penalty() {
+        let problem = problem();
+        let state = problem.state(groups(&[0, 1, 1, 1, 2, 0, 2, 2]));
+        assert!(state.total() >= problem.objective.hard_penalty());
     }
 }

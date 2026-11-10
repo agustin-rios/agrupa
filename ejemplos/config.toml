@@ -1,0 +1,73 @@
+# Criterios para armar grupos con ejemplos/alumnos.csv.
+# Los nombres de columna deben coincidir con los encabezados del CSV
+# (no importan mayúsculas ni espacios al borde).
+
+id_column = "id"          # obligatoria: identificador único
+name_column = "nombre"    # opcional: nombre para mostrar
+# delimiter = ";"         # opcional: "," ";" o "tab"; si se omite, se detecta solo
+
+[groups]
+size = 4                  # alumnos por grupo (o `count = 8` para fijar la cantidad de grupos)
+# min_size = 3            # opcionales: permiten tamaños distintos si eso mejora el resultado
+# max_size = 5
+
+# Cada atributo es una columna con un objetivo:
+#   numeric      balance  → promedios parejos entre grupos
+#                similar  → valores parecidos dentro de cada grupo
+#   categorical  spread   → misma proporción de cada valor en todos los grupos
+#                together → mismo valor dentro del grupo
+#                cover    → la mayor variedad posible en cada grupo
+#   tags         spread   → cada etiqueta repartida en proporción
+#                cover    → que cada grupo tenga todas las etiquetas
+# `weight` (por defecto 1): con 1, pasar de un reparto al azar a uno perfecto vale 1.
+
+[[attributes]]
+column = "promedio"
+kind = "numeric"
+goal = "balance"
+weight = 2.0
+
+[[attributes]]
+column = "compromiso"
+kind = "numeric"
+goal = "similar"
+
+[[attributes]]
+column = "genero"
+label = "género"          # opcional: nombre en los reportes
+kind = "categorical"
+goal = "spread"
+
+[[attributes]]
+column = "carrera"
+kind = "categorical"
+goal = "cover"
+
+[[attributes]]
+column = "horario"
+kind = "categorical"
+goal = "together"
+
+[[attributes]]
+column = "habilidades"
+kind = "tags"
+goal = "cover"
+weight = 2.0
+# separator = ";,"        # caracteres que separan etiquetas (por defecto coma y punto y coma)
+
+# Preferencias blandas: ids o nombres exactos, separados por coma.
+[preferences]
+prefer_column = "quiero_trabajar_con"
+avoid_column = "prefiero_evitar"
+weight = 1.0
+
+# Restricciones duras: siempre se cumplen.
+[constraints]
+together = [["a26", "a27"]]   # deben quedar en el mismo grupo
+apart = [["a02", "a13"]]      # deben quedar en grupos distintos
+
+# Esfuerzo de búsqueda (opcional). Con la misma semilla, el resultado es el mismo.
+[solver]
+iterations = 1000000
+restarts = 8
+seed = 42

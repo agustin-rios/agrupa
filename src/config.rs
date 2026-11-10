@@ -153,7 +153,7 @@ pub struct SolverConfig {
 
 impl Default for SolverConfig {
     fn default() -> Self {
-        Self { iterations: 200_000, restarts: 8, seed: 42 }
+        Self { iterations: 1_000_000, restarts: 8, seed: 42 }
     }
 }
 

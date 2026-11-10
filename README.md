@@ -68,7 +68,7 @@ agrupa armar -a ejemplos/alumnos.csv -c ejemplos/config.toml -s grupos.csv
 | `-c, --config` | Criterios (TOML) |
 | `-s, --salida` | CSV de salida (por defecto `grupos.csv`) |
 | `--json` | Guarda además el detalle en JSON |
-| `--iteraciones`, `--reinicios`, `--semilla` | Esfuerzo de búsqueda; con la misma semilla, el resultado es el mismo |
+| `--iteraciones`, `--reinicios`, `--semilla` | Esfuerzo de búsqueda (por defecto 1.000.000, 8 y 42, o lo que diga `[solver]`). Con la misma semilla, el resultado es el mismo |
 
 ### Sugerir grupo para alumnos nuevos
 
@@ -79,12 +79,17 @@ agrupa sugerir -a ejemplos/alumnos.csv -n ejemplos/nuevos.csv -c ejemplos/config
 - `-g` es la asignación actual (la que generó `armar`).
 - `-n` es opcional. Todo alumno de `-a` que no esté en la asignación también cuenta como nuevo, así que puedes volver a exportar el formulario completo y correr `sugerir` sin separar a los nuevos.
 - `-s` guarda la asignación actualizada. Sin esta opción, solo muestra la sugerencia.
+- Si llegan varios nuevos a la vez, se reparten entre ellos para el mejor resultado conjunto. A los que ya tenían grupo no se los mueve.
+- Si `config.toml` no define `max_size`, primero se llenan los grupos más chicos.
 
 ### Evaluar una asignación (por ejemplo, una hecha a mano)
 
 ```bash
 agrupa evaluar -a ejemplos/alumnos.csv -c ejemplos/config.toml -g grupos.csv
+agrupa evaluar -a ejemplos/alumnos.csv -n ejemplos/nuevos.csv -c ejemplos/config.toml -g grupos_v2.csv
 ```
+
+`-n` es opcional y se suma a `-a`, igual que en `sugerir`. `--json` guarda el detalle.
 
 ### Ayuda
 
@@ -162,7 +167,7 @@ apart = [["a02", "a13"]]
 - `weight`: importancia relativa (por defecto 1). Con 1, pasar de un reparto al azar a uno perfecto en ese criterio vale 1, así que los pesos se comparan entre columnas de distinta escala.
 - `[preferences]`: blandas, se intentan cumplir.
 - `[constraints]`: duras, `together` (deben ir juntos) y `apart` (deben ir separados).
-- `[solver]` (opcional): `iterations`, `restarts`, `seed`.
+- `[solver]` (opcional): `iterations` (por defecto 1.000.000 por reinicio), `restarts` (8, en paralelo) y `seed` (42).
 
 En `ejemplos/config.toml` hay un ejemplo completo y comentado.
 
@@ -179,13 +184,47 @@ Es la entrada `-g` de `sugerir` y `evaluar`. Puedes editarla a mano: solo se lee
 
 ## 4. Cómo leer el reporte
 
+### `armar` y `evaluar`
+
 ```
+8 grupos: 6 de 4 y 2 de 3 alumnos
+
 Calidad (100 % = ideal · 0 % = como un reparto al azar)
-  promedio     balancear    97 %   promedios de grupo entre 5.32 y 5.45 (global 5.41)
-  habilidades  cubrir      100 %   0 ausencias (mínimo posible 0, al azar ≈ 5.5)
+  promedio      balancear    96 %   promedios de grupo entre 5.30 y 5.50 (global 5.41)
+  compromiso    homogéneo    54 %   dispersión dentro de los grupos 0.74 (mínimo ≈ 0.29, al azar ≈ 1.05)
+  género        repartir    100 %   F 1–2 · M 1–2 por grupo
+  habilidades   cubrir      100 %   1 ausencia (mínimo posible 1, al azar ≈ 7.6)
+  preferencias  cumplir      38 %   6 de 14 elecciones cumplidas · 8 sin ninguno de sus elegidos · ...
+Restricciones: todas cumplidas (1 juntos · 1 separados)
+
+Grupo 1 (4): Antonia Carrasco, Josefa Vergara, Matías Espinoza, Joaquín Valenzuela
+   promedio 5.30 · compromiso 2–4 · género F ×2, M ×2
+   carrera Ing. Computación, Ing. Civil Industrial, Ing. Eléctrica, Ing. Matemática
+   horario Tarde ×2, Mañana ×2 · habilidades: todas
 ```
 
-En `sugerir`, **Δ** es el cambio en el costo total al sumar al alumno: mientras más bajo, mejor. Junto al Δ se muestra qué criterios mejoran o empeoran y por qué (por ejemplo, "aporta Diseño UX, que faltaba").
+- Cada criterio se mide de 0 % (como un reparto al azar) a 100 % (lo mejor posible solo para ese criterio). Puede ser negativo si una asignación hecha a mano queda peor que el azar.
+- Rara vez se llega a 100 % en todos: los criterios compiten entre sí. Por ejemplo, juntar por horario choca con mezclar carreras. Si un criterio importa más, súbele el `weight`.
+- Ojo con los criterios correlacionados. Si el compromiso va de la mano con las notas, pedir compromiso `similar` es pedir grupos de buenas notas, lo contrario de `balance` en promedio.
+- Bajo los criterios viene cada grupo con su resumen, para ver por qué quedó así.
+
+### `sugerir`
+
+```
+Paula Henríquez (a31) → grupo 3
+     grupo  tamaño       Δ
+   ★ 3       3 → 4    -0.181
+     agrandando un grupo: 4 (4 → 5, -0.108) · 1 (4 → 5, +0.027) · 2 (4 → 5, +0.056)
+   Por qué el grupo 3:
+     mejora   habilidades    -0.295  aporta Diseño UX, que faltaba
+     mejora   carrera        -0.178  aporta Diseño, que no estaba
+     empeora  género         +0.138  F: 2 → 3 (proporcional 2)
+     empeora  preferencias   +0.072  eligió a Sofía Navarro, que está en el grupo 6
+```
+
+- **Δ** es el cambio en el costo total al sumar al alumno: mientras más bajo, mejor. Usa la misma escala que los pesos: con `weight = 1`, pasar de "al azar" a "ideal" en un criterio vale 1.
+- Arriba van los grupos con cupo. "agrandando un grupo" muestra las mejores opciones que dejarían un grupo más grande que el resto, por si prefieres aceptar esa diferencia.
+- "Por qué" desglosa el Δ por criterio, de mayor a menor efecto.
 
 ## 5. Desarrollo
 
@@ -204,4 +243,6 @@ cargo fmt             # formato
 | `src/solver.rs` | Recocido simulado |
 | `src/report.rs` | Reportes de texto y JSON |
 | `src/suggest.rs` | Sugerencia para alumnos nuevos |
+| `src/assignment.rs` | Lectura y escritura de la asignación (`id,nombre,grupo`) |
 | `src/main.rs` | CLI |
+| `tests/ejemplos.rs` | Pruebas de punta a punta con `ejemplos/` |
